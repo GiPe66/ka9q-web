@@ -11,6 +11,8 @@
 //
 
 #define _GNU_SOURCE 1
+#include "/usr/include/sched.h"
+#include <pthread.h>
 
 #include <onion/log.h>
 #include <onion/onion.h>
@@ -98,8 +100,9 @@ void *spectrum_thread(void *arg);
 void *ctrl_thread(void *arg);
 
 struct frontend Frontend;
-struct sockaddr Metadata_source_socket;       // Source of metadata
-struct sockaddr Metadata_dest_socket;         // Dest of metadata (typically multicast)
+int Verbose;
+struct sockaddr_storage Metadata_source_socket;       // Source of metadata
+struct sockaddr_storage Metadata_dest_socket;         // Dest of metadata (typically multicast)
 
 static int const DEFAULT_IP_TOS = 48;
 static int const DEFAULT_MCAST_TTL = 1;
@@ -237,9 +240,13 @@ static void check_frequency(struct session *sp) {
   }
   if (min_f < 0) {
     sp->center_frequency = (sp->bin_width * sp->bins) / 2;
-  } else if (max_f > (Frontend.samprate / 2)) {
-    sp->center_frequency = (Frontend.samprate / 2) - (sp->bin_width * sp->bins) / 2;
   }
+  // NOTE: removed a broken "else if (max_f > Frontend.samprate/2)" clamp here.
+  // Frontend.samprate is a double (front-end raw ADC rate, e.g. 10 MHz for the
+  // SDRplay), while sp->frequency can legitimately be far above that (e.g. 144 MHz
+  // VHF, since the front end retunes its own LO). The old code computed a negative
+  // double and assigned it into uint32_t center_frequency, which on ARM64 saturates
+  // to 0 (FCVTZU), silently sending "center on 0 Hz" and starving the spectrum FFT.
 }
 
 struct zoom_table_t {
@@ -372,9 +379,8 @@ onion_connection_status websocket_cb(void *data, onion_websocket * ws,
         }
         if(min_f<0) {
           sp->center_frequency=(sp->bin_width*sp->bins)/2;
-        } else if (max_f > (Frontend.samprate / 2)) {
-          sp->center_frequency = (Frontend.samprate / 2) - (sp->bin_width * sp->bins) / 2;
         }
+        // NOTE: removed the equivalent broken clamp here too (see check_frequency()).
         check_frequency(sp);
         control_set_frequency(sp,&tmp[2]);
         break;
@@ -613,7 +619,7 @@ static void *audio_thread(void *arg) {
 
   {
     pthread_mutex_lock(&output_dest_socket_mutex);
-    while(Channel.output.dest_socket.sa_family == 0)
+    while(Channel.output.dest_socket.ss_family == 0)
         pthread_cond_wait(&output_dest_socket_cond, &output_dest_socket_mutex);
     Input_fd = listen_mcast(NULL,&Channel.output.dest_socket,NULL);
     pthread_mutex_unlock(&output_dest_socket_mutex);
@@ -828,7 +834,7 @@ void control_get_powers(struct session *sp,float frequency,int bins,float bin_bw
   encode_int(&bp,DEMOD_TYPE,SPECT_DEMOD);
   encode_double(&bp,RADIO_FREQUENCY,frequency);
   encode_int(&bp,BIN_COUNT,bins);
-  encode_float(&bp,NONCOHERENT_BIN_BW,bin_bw);
+  encode_float(&bp,RESOLUTION_BW,bin_bw);
   encode_eol(&bp);
   int const command_len = bp - cmdbuffer;
   pthread_mutex_lock(&ctl_mutex);
@@ -861,6 +867,7 @@ int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *b
   double l_lo1 = 0,l_lo2 = 0;
 #endif
   int l_ccount = 0;
+  bool ssrc_checked = false;
   uint8_t const *cp = buffer;
   int l_count=1234567;
 
@@ -890,9 +897,14 @@ int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *b
     case GPS_TIME:
       *time = decode_int64(cp,optlen);
       break;
-    case OUTPUT_SSRC: // Don't really need this, it's already been checked
-      if(decode_int32(cp,optlen) != ssrc)
-        return -1; // Not what we want
+    case OUTPUT_SSRC:
+      if(!ssrc_checked){
+        ssrc_checked = true;
+        int32_t got_ssrc = decode_int32(cp,optlen);
+        if(got_ssrc != ssrc) {
+          return -1; // Not what we want
+        }
+      }
       break;
     case DEMOD_TYPE:
      {
@@ -933,7 +945,7 @@ int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *b
       sp->bins_min_db = (sp->bins_min_db == 0) ? -120 : 10.0 * log10(sp->bins_min_db);
       sp->bins_max_db = (sp->bins_max_db == 0) ? -120 : 10.0 * log10(sp->bins_max_db);
       break;
-    case NONCOHERENT_BIN_BW:
+    case RESOLUTION_BW:
       *bin_bw = decode_float(cp,optlen);
       break;
     case IF_POWER:
@@ -1018,7 +1030,8 @@ int init_demod(struct channel *channel){
   channel->tune.freq = channel->tune.shift = NAN;
   channel->filter.min_IF = channel->filter.max_IF = channel->filter.kaiser_beta = NAN;
   channel->output.headroom = channel->linear.hangtime = channel->linear.recovery_rate = NAN;
-  channel->sig.bb_power = channel->sig.snr = channel->sig.foffset = NAN;
+  channel->sig.bb_power = channel->sig.foffset = NAN;
+  channel->pll.snr = channel->fm.snr = NAN;
   channel->fm.pdeviation = channel->pll.cphase = NAN;
   channel->output.gain = NAN;
   channel->tp1 = channel->tp2 = NAN;
@@ -1139,8 +1152,8 @@ void *ctrl_thread(void *arg) {
           memcpy((void*)ip,&Frontend.samples,8); ip+=2;
           memcpy((void*)ip,&Frontend.overranges,8); ip+=2;
           memcpy((void*)ip,&Frontend.samp_since_over,8); ip+=2;
-          memcpy((void*)ip,&Frontend.timestamp,8); ip+=2;
-          memcpy((void*)ip,&Channel.status.blocks_since_poll,8); ip+=2;
+          memcpy((void*)ip,&Channel.clocktime,8); ip+=2;
+          memcpy((void*)ip,&(uint64_t){0},8); ip+=2;
           memcpy((void*)ip,&Frontend.rf_atten,4); ip++;
           memcpy((void*)ip,&Frontend.rf_gain,4); ip++;
           memcpy((void*)ip,&Frontend.rf_level_cal,4); ip++;
@@ -1155,6 +1168,7 @@ void *ctrl_thread(void *arg) {
           int length=(PKTSIZE-header_size)/sizeof(float);
           int npower = extract_powers(powers,length,&time,&r_freq,&r_bin_bw,sp->ssrc+1,buffer+1,rx_length-1,sp);
           if(npower < 0){
+            fprintf(stderr,"extract_powers failed: got SSRC %u, expected %u, npower=%d rx_length=%d\n",ssrc,sp->ssrc+1,npower,rx_length);
             /* char filename[256]; */
             /* sprintf(filename,"%d_%d_%08X.bin",error_count,ssrc,sp->last_poll_tag); */
             /* FILE *f = fopen(filename,"w"); */
@@ -1278,12 +1292,10 @@ void *ctrl_thread(void *arg) {
           if (0 == extract_noise(&n0,buffer+1,rx_length-1,sp)){
             sp->noise_density_audio = n0;
           }
-          // check to see if the preset matches our request
-          if (strncmp(Channel.preset,sp->requested_preset,sizeof(sp->requested_preset))) {
-            if (verbose)
-              fprintf(stderr,"SSRC %u requested preset %s, but poll returned preset %s, retry preset\n",sp->ssrc,sp->requested_preset,Channel.preset);
-            control_set_mode(sp,sp->requested_preset);
-          }
+          // NOTE: disabled -- Channel.preset is never populated by decode_radio_status()
+          // (current radiod's decode_status.c has no case for PRESET, and radiod's own
+          // source marks chan->preset "deprecated, will go away"), so this comparison
+          // always mismatched and caused an unthrottled retry loop, pegging radiod's CPU.
           // verify tuned frequency is correct, too
           if (Channel.tune.freq != sp->frequency){
             if (verbose)
@@ -1296,7 +1308,7 @@ void *ctrl_thread(void *arg) {
             control_set_frequency(sp,f);
           }
           pthread_mutex_lock(&output_dest_socket_mutex);
-          if(Channel.output.dest_socket.sa_family != 0)
+          if(Channel.output.dest_socket.ss_family != 0)
             pthread_cond_broadcast(&output_dest_socket_cond);
           pthread_mutex_unlock(&output_dest_socket_mutex);
           struct rtp_header rtp;
