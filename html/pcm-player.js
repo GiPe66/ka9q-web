@@ -7,14 +7,14 @@ PCMPlayer.prototype.init = function(option) {
         encoding: '16bitInt',
         channels: 1,
         sampleRate: 48000,
-        flushingTime: 500
+        flushingTime: 500 // unused now, kept for API compatibility
     };
     this.option = Object.assign({}, defaults, option);
-    this.samples = new Float32Array();
-    this.flush = this.flush.bind(this);
-    this.interval = setInterval(this.flush, this.option.flushingTime);
     this.maxValue = this.getMaxValue();
     this.typedArray = this.getTypedArray();
+    // Queue of resampled samples (interleaved per channel, at the AudioContext's
+    // native rate) waiting to be played.
+    this.queue = new Float32Array(0);
     this.createContext();
 };
 
@@ -45,12 +45,44 @@ PCMPlayer.prototype.createContext = function() {
 
     // context needs to be resumed on iOS and Safari (or it will stay in "suspended" state)
     this.audioCtx.resume();
-    //this.audioCtx.onstatechange = () => console.log(this.audioCtx.state);   // if you want to see "Running" state in console and be happy about it
-    
+
     this.gainNode = this.audioCtx.createGain();
     this.gainNode.gain.value = 1;
     this.gainNode.connect(this.audioCtx.destination);
-    this.startTime = this.audioCtx.currentTime;
+
+    // Continuous, callback-driven playback instead of scheduling separate
+    // AudioBufferSourceNode chunks back-to-back. Chaining discrete buffers
+    // that way is prone to audible micro-clicks/buzz at each chunk boundary
+    // in some browsers (observed: Chrome, not Firefox/Edge). A
+    // ScriptProcessorNode instead pulls exactly the samples the audio engine
+    // asks for on every callback, which is gapless by construction.
+    var self = this;
+    var channels = this.option.channels;
+    this.scriptNode = this.audioCtx.createScriptProcessor(4096, 0, channels);
+    this.scriptNode.onaudioprocess = function(e) {
+        self._processAudio(e);
+    };
+    this.scriptNode.connect(this.gainNode);
+};
+
+PCMPlayer.prototype._processAudio = function(e) {
+    var channels = this.option.channels;
+    var outLen = e.outputBuffer.length;
+    var available = Math.floor(this.queue.length / channels);
+    var take = Math.min(outLen, available);
+    var c, j;
+    for (c = 0; c < channels; c++) {
+        var out = e.outputBuffer.getChannelData(c);
+        for (j = 0; j < take; j++) {
+            out[j] = this.queue[j * channels + c];
+        }
+        for (; j < outLen; j++) {
+            out[j] = 0; // underrun (no data yet): silence, not a glitch
+        }
+    }
+    if (take > 0) {
+        this.queue = this.queue.slice(take * channels);
+    }
 };
 
 PCMPlayer.prototype.resume = function() {
@@ -67,11 +99,43 @@ PCMPlayer.prototype.feed = function(data) {
         return;
     }
     var fdata = this.getFormatedValue(data);
-    var tmp = new Float32Array(this.samples.length + fdata.length);
-    tmp.set(this.samples, 0);
-    tmp.set(fdata, this.samples.length);
-    this.samples = tmp;
+    var resampled = this._resample(fdata);
+    var tmp = new Float32Array(this.queue.length + resampled.length);
+    tmp.set(this.queue, 0);
+    tmp.set(resampled, this.queue.length);
+    this.queue = tmp;
     this.audioCtx.resume();
+};
+
+// Linear-interpolation resample from this.option.sampleRate (the nominal rate
+// of the incoming PCM, e.g. 12000 Hz) to the AudioContext's actual native
+// rate, so no implicit resampling happens anywhere else in the pipeline.
+PCMPlayer.prototype._resample = function(fdata) {
+    var channels = this.option.channels;
+    var srcRate = this.option.sampleRate;
+    var dstRate = this.audioCtx.sampleRate;
+    if (srcRate === dstRate) {
+        return fdata;
+    }
+    var srcFrames = fdata.length / channels;
+    var ratio = dstRate / srcRate;
+    var dstFrames = Math.round(srcFrames * ratio);
+    var out = new Float32Array(dstFrames * channels);
+    var c, i;
+    for (c = 0; c < channels; c++) {
+        for (i = 0; i < dstFrames; i++) {
+            var srcPos = i / ratio;
+            var idx0 = Math.floor(srcPos);
+            var frac = srcPos - idx0;
+            var idx1 = idx0 + 1;
+            if (idx0 >= srcFrames) idx0 = srcFrames - 1;
+            if (idx1 >= srcFrames) idx1 = srcFrames - 1;
+            var s0 = fdata[idx0 * channels + c];
+            var s1 = fdata[idx1 * channels + c];
+            out[i * channels + c] = s0 + (s1 - s0) * frac;
+        }
+    }
+    return out;
 };
 
 PCMPlayer.prototype.getFormatedValue = function(data) {
@@ -89,51 +153,11 @@ PCMPlayer.prototype.volume = function(volume) {
 };
 
 PCMPlayer.prototype.destroy = function() {
-    if (this.interval) {
-        clearInterval(this.interval);
+    if (this.scriptNode) {
+        this.scriptNode.disconnect();
+        this.scriptNode.onaudioprocess = null;
     }
-    this.samples = null;
+    this.queue = null;
     this.audioCtx.close();
     this.audioCtx = null;
-};
-
-PCMPlayer.prototype.flush = function() {
-    if (!this.samples.length) return;
-    var bufferSource = this.audioCtx.createBufferSource(),
-        length = this.samples.length / this.option.channels,
-        audioBuffer = this.audioCtx.createBuffer(this.option.channels, length, this.option.sampleRate),
-        audioData,
-        channel,
-        offset,
-        i,
-        decrement;
-
-    for (channel = 0; channel < this.option.channels; channel++) {
-        audioData = audioBuffer.getChannelData(channel);
-        offset = channel;
-        decrement = 50;
-        for (i = 0; i < length; i++) {
-            audioData[i] = this.samples[offset];
-            /* fadein */
-// just make this a simple copy to eliminate thumping - KA9Q 7 March 2024
-//            if (i < 50) {
-//                audioData[i] =  (audioData[i] * i) / 50;
-//            }
-            /* fadeout*/
-//            if (i >= (length - 51)) {
-//                audioData[i] =  (audioData[i] * decrement--) / 50;
-//            }
-            offset += this.option.channels;
-        }
-    }
-    
-    if (this.startTime < this.audioCtx.currentTime) {
-        this.startTime = this.audioCtx.currentTime;
-    }
-    //console.log('start vs current '+this.startTime+' vs '+this.audioCtx.currentTime+' duration: '+audioBuffer.duration);
-    bufferSource.buffer = audioBuffer;
-    bufferSource.connect(this.gainNode);
-    bufferSource.start(this.startTime);
-    this.startTime += audioBuffer.duration;
-    this.samples = new Float32Array();
 };
