@@ -630,7 +630,9 @@ function setSpectrumMax() {
 function level_to_string(f) {
   let bin = spectrum.hz_to_bin(f);
   let s = "";
-  if ((bin < 0) || (bin >= binCount)) {
+  if (!(bin >= 0 && bin < binCount)) {
+    // flipped comparison also catches bin === NaN, e.g. when
+    // spectrum.cursor_freq is still undefined (no hover/click yet)
     return;
   }
 
