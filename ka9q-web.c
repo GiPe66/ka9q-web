@@ -78,6 +78,7 @@ struct session {
   float noise_density_audio;
   int zoom_index;
   char requested_preset[32];
+  int preset_retries;      // bounded retry counter for control_set_mode(), see ctrl_thread()
   float bins_min_db;
   float bins_max_db;
   float bins_autorange_gain;
@@ -387,6 +388,7 @@ onion_connection_status websocket_cb(void *data, onion_websocket * ws,
       case 'M':
       case 'm':
         control_set_mode(sp,&tmp[2]);
+        sp->preset_retries = 5; // bounded retries to cover the connection-time race, see ctrl_thread()
         control_poll(sp);
         break;
       case 'Z':
@@ -1147,16 +1149,31 @@ void *ctrl_thread(void *arg) {
           // Should this be TLV encoding like the radiod RTP streams?
           // Dealing with endian and zero suppression in javascript
           // looked painful, so I went quick-n-dirty here
-          memcpy((void*)ip,&Frontend.samprate,4); ip++;
-          memcpy((void*)ip,&Frontend.rf_agc,4); ip++;
+          {
+            uint32_t samprate_i = (uint32_t)Frontend.samprate;
+            memcpy((void*)ip,&samprate_i,4); ip++;
+          }
+          {
+            uint32_t rf_agc_i = Frontend.rf_agc ? 1 : 0;
+            memcpy((void*)ip,&rf_agc_i,4); ip++;
+          }
           memcpy((void*)ip,&Frontend.samples,8); ip+=2;
           memcpy((void*)ip,&Frontend.overranges,8); ip+=2;
           memcpy((void*)ip,&Frontend.samp_since_over,8); ip+=2;
           memcpy((void*)ip,&Channel.clocktime,8); ip+=2;
           memcpy((void*)ip,&(uint64_t){0},8); ip+=2;
-          memcpy((void*)ip,&Frontend.rf_atten,4); ip++;
-          memcpy((void*)ip,&Frontend.rf_gain,4); ip++;
-          memcpy((void*)ip,&Frontend.rf_level_cal,4); ip++;
+          {
+            float rf_atten_f = (float)Frontend.rf_atten;
+            memcpy((void*)ip,&rf_atten_f,4); ip++;
+          }
+          {
+            float rf_gain_f = (float)Frontend.rf_gain;
+            memcpy((void*)ip,&rf_gain_f,4); ip++;
+          }
+          {
+            float rf_level_cal_f = (float)Frontend.rf_level_cal;
+            memcpy((void*)ip,&rf_level_cal_f,4); ip++;
+          }
           memcpy((void*)ip,&sp->if_power,4); ip++;
           memcpy((void*)ip,&sp->noise_density_audio,4); ip++;
           memcpy((void*)ip,&sp->zoom_index,4); ip++;
@@ -1292,10 +1309,19 @@ void *ctrl_thread(void *arg) {
           if (0 == extract_noise(&n0,buffer+1,rx_length-1,sp)){
             sp->noise_density_audio = n0;
           }
-          // NOTE: disabled -- Channel.preset is never populated by decode_radio_status()
-          // (current radiod's decode_status.c has no case for PRESET, and radiod's own
-          // source marks chan->preset "deprecated, will go away"), so this comparison
-          // always mismatched and caused an unthrottled retry loop, pegging radiod's CPU.
+          // Channel.preset is never populated by decode_radio_status() (current radiod's
+          // decode_status.c has no case for PRESET, and radiod's own source marks
+          // chan->preset "deprecated, will go away"), so we can't verify the preset
+          // actually took effect. Instead, retry a bounded number of times after each
+          // mode-change request (armed in the 'M'/'m' websocket case above), to cover
+          // the race where the very first M: command after connecting can arrive
+          // before the channel is fully set up and gets silently dropped.
+          if (sp->preset_retries > 0) {
+            sp->preset_retries--;
+            if (verbose)
+              fprintf(stderr,"SSRC %u re-sending preset %s (retries left: %d)\n",sp->ssrc,sp->requested_preset,sp->preset_retries);
+            control_set_mode(sp,sp->requested_preset);
+          }
           // verify tuned frequency is correct, too
           if (Channel.tune.freq != sp->frequency){
             if (verbose)
