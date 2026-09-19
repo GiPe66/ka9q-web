@@ -548,10 +548,16 @@ function calcFrequencies() {
 
     function zoomin() {
       ws.send("Z:+:"+document.getElementById('freq').value);
+      const zoom_el = document.getElementById("zoom_level");
+      target_zoom_level = Math.max(parseInt(zoom_el.min), target_zoom_level - 1);
+      zoom_el.value = target_zoom_level;
       saveSettings();
     }
     function zoomout() {
       ws.send("Z:-:"+document.getElementById('freq').value);
+      const zoom_el = document.getElementById("zoom_level");
+      target_zoom_level = Math.min(parseInt(zoom_el.max), target_zoom_level + 1);
+      zoom_el.value = target_zoom_level;
       saveSettings();
     }
     function zoomcenter() {

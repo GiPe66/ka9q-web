@@ -220,14 +220,25 @@ void websocket_closed(struct session *sp) {
   pthread_mutex_lock(&sp->ws_mutex);
   control_set_frequency(sp,"0");
   sp->audio_active=false;
+  bool need_join = false;
   if(sp->spectrum_active) {
     pthread_mutex_lock(&sp->spectrum_mutex);
     sp->spectrum_active=false;
     stop_spectrum_stream(sp);
     pthread_mutex_unlock(&sp->spectrum_mutex);
-    pthread_join(sp->spectrum_task,NULL);
+    need_join = true;
   }
   pthread_mutex_unlock(&sp->ws_mutex);
+  if (need_join) {
+    // Join outside ws_mutex: ctrl_thread() needs sp->ws_mutex (while holding
+    // the global session_mutex) to deliver every spectrum update for every
+    // session, so holding ws_mutex here while blocked in pthread_join() can
+    // stall ctrl_thread for every other session too. A burst of reconnects
+    // (e.g. repeated page reloads) can cascade into starving the whole HTTP
+    // server's worker pool. spectrum_thread's loop never touches ws_mutex,
+    // so it is safe to join after releasing it.
+    pthread_join(sp->spectrum_task,NULL);
+  }
 }
 
 static void check_frequency(struct session *sp) {
