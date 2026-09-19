@@ -319,15 +319,9 @@ function calcFrequencies() {
         centerHz = 10000000;
         binWidthHz = 20000;
         spectrum = new Spectrum("waterfall", {spectrumPercent: 50, bins: binCount});
-        if (!loadSettings()) {
+        const freshSession = !loadSettings();
+        if (freshSession) {
           spectrum.setSpectrumPercent(50);
-          spectrum.setFrequency(frequencyHz);
-          spectrum.setCenterHz(centerHz);
-          spectrum.setSpanHz(binWidthHz * binCount);
-          lowHz = centerHz - ((binWidthHz * binCount) / 2);
-          spectrum.setLowHz(lowHz);
-          highHz = centerHz + ((binWidthHz * binCount) / 2);
-          spectrum.setHighHz(highHz);
           spectrum.averaging = 0;
           spectrum.maxHold = false;
           spectrum.paused = false;
@@ -337,6 +331,24 @@ function calcFrequencies() {
           spectrum.bins = binCount;
           document.getElementById('mode').value = "am";
         }
+        // Whether this came from loadSettings() (restored centerHz from
+        // localStorage, e.g. from a previous, possibly stale/broken session)
+        // or from the defaults just above, lowHz/highHz must be (re)computed
+        // from the current centerHz *now*. Previously this only happened
+        // inside the "fresh session" branch, so a restored session kept the
+        // module-level literal defaults (lowHz=0, highHz=32400000) until a
+        // server packet happened to report a *different* center/bins than
+        // the client already had cached -- which, since the client also
+        // immediately re-sends its cached center to the server via "Z:c:",
+        // often never happened, leaving the displayed window permanently
+        // out of sync with the real tuned/center frequency.
+        spectrum.setFrequency(frequencyHz);
+        spectrum.setCenterHz(centerHz);
+        spectrum.setSpanHz(binWidthHz * binCount);
+        lowHz = centerHz - ((binWidthHz * binCount) / 2);
+        spectrum.setLowHz(lowHz);
+        highHz = centerHz + ((binWidthHz * binCount) / 2);
+        spectrum.setHighHz(highHz);
         spectrum.radio_pointer = this;
         page_title = "";
 

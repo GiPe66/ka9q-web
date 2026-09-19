@@ -397,8 +397,15 @@ Spectrum.prototype.resize = function() {
         this.axes.height != this.spectrumHeight) {
         this.axes.width = width;
         this.axes.height = this.spectrumHeight;
-        this.updateAxes();
     }
+    // Always redraw the axes on every resize() call (called on every
+    // addData(), ~10x/s), instead of only when the canvas dimensions
+    // change. The dimension-change gate could leave the axes canvas
+    // showing whatever it had at the last dimension change (sometimes
+    // blank/stale, e.g. right at page load before center/high frequency
+    // were finalized), with nothing forcing a redraw until some other
+    // interaction (zoom, etc.) happened to change the dimensions again.
+    this.updateAxes();
     this.saveSettings();
 }
 

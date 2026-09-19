@@ -13,6 +13,7 @@
 #define _GNU_SOURCE 1
 #include "/usr/include/sched.h"
 #include <pthread.h>
+#include <math.h>
 
 #include <onion/log.h>
 #include <onion/onion.h>
@@ -105,7 +106,7 @@ int Verbose;
 struct sockaddr_storage Metadata_source_socket;       // Source of metadata
 struct sockaddr_storage Metadata_dest_socket;         // Dest of metadata (typically multicast)
 
-static int const DEFAULT_IP_TOS = 48;
+//static int const DEFAULT_IP_TOS = 48;
 static int const DEFAULT_MCAST_TTL = 1;
 
 uint64_t Metadata_packets;
@@ -239,15 +240,34 @@ static void check_frequency(struct session *sp) {
     min_f=sp->center_frequency-((sp->bin_width*sp->bins)/2);
     max_f=sp->center_frequency+((sp->bin_width*sp->bins)/2);
   }
-  if (min_f < 0) {
+  // Clamp to the front end's actual valid IF window: Frontend.frequency is the
+  // locked LO/tuned frequency, and Frontend.min_IF/max_IF are the (possibly
+  // negative, possibly asymmetric) offsets that bound where real, non-aliased
+  // data exists. This generalizes the old "min_f < 0" floor, which implicitly
+  // assumed a zero-IF direct-sampling front end starting at 0 Hz -- true for
+  // something like the rx888, but wrong for the Airspy R2, whose valid window
+  // sits entirely *below* its locked frequency (e.g. LO 148 MHz, valid range
+  // 138.6-147.4 MHz). Without this, a wide-enough span silently requests bins
+  // outside that window, and radiod hands back the aliased image there instead
+  // of real data (seen as static/garbled blocks in the waterfall).
+  if (!isnan(Frontend.min_IF) && !isnan(Frontend.max_IF) && !isnan(Frontend.frequency)) {
+    int32_t lo_edge = (int32_t)(Frontend.frequency + Frontend.min_IF);
+    int32_t hi_edge = (int32_t)(Frontend.frequency + Frontend.max_IF);
+    int32_t span = sp->bin_width * sp->bins;
+    int32_t valid_span = hi_edge - lo_edge;
+    if (span >= valid_span) {
+      // Requested span is wider than the whole valid window: pinning either
+      // edge would push the other edge even further outside it, so center on
+      // the valid window itself instead.
+      sp->center_frequency = lo_edge + valid_span / 2;
+    } else if (min_f < lo_edge) {
+      sp->center_frequency = lo_edge + span / 2;
+    } else if (max_f > hi_edge) {
+      sp->center_frequency = hi_edge - span / 2;
+    }
+  } else if (min_f < 0) {
     sp->center_frequency = (sp->bin_width * sp->bins) / 2;
   }
-  // NOTE: removed a broken "else if (max_f > Frontend.samprate/2)" clamp here.
-  // Frontend.samprate is a double (front-end raw ADC rate, e.g. 10 MHz for the
-  // SDRplay), while sp->frequency can legitimately be far above that (e.g. 144 MHz
-  // VHF, since the front end retunes its own LO). The old code computed a negative
-  // double and assigned it into uint32_t center_frequency, which on ARM64 saturates
-  // to 0 (FCVTZU), silently sending "center on 0 Hz" and starving the spectrum FFT.
 }
 
 struct zoom_table_t {
@@ -371,17 +391,6 @@ onion_connection_status websocket_cb(void *data, onion_websocket * ws,
       case 'F':
       case 'f':
         sp->frequency = strtod(&tmp[2],0) * 1000;
-        int32_t min_f=sp->center_frequency-((sp->bin_width*sp->bins)/2);
-        int32_t max_f=sp->center_frequency+((sp->bin_width*sp->bins)/2);
-        if(sp->frequency<min_f || sp->frequency>max_f) {
-          sp->center_frequency=sp->frequency;
-          min_f=sp->center_frequency-((sp->bin_width*sp->bins)/2);
-          max_f=sp->center_frequency+((sp->bin_width*sp->bins)/2);
-        }
-        if(min_f<0) {
-          sp->center_frequency=(sp->bin_width*sp->bins)/2;
-        }
-        // NOTE: removed the equivalent broken clamp here too (see check_frequency()).
         check_frequency(sp);
         control_set_frequency(sp,&tmp[2]);
         break;
@@ -415,7 +424,7 @@ onion_connection_status websocket_cb(void *data, onion_websocket * ws,
               sp->center_frequency = f;
             }
           }
-          //check_frequency(sp);
+          check_frequency(sp);
         } else {
           char *end_ptr;
           long int zoom_level = strtol(&tmp[2],&end_ptr,10);
@@ -1129,6 +1138,16 @@ void *ctrl_thread(void *arg) {
           // is it kosher to call this here? It made some of the stat values
           // update more often, so I hacked it in.
           decode_radio_status(&Frontend,&Channel,buffer+1,rx_length-1);
+
+          // Frontend.min_IF/max_IF/frequency are reset to NaN on every new
+          // connection (see init_control()) and only become valid once the
+          // first status packet from radiod is decoded (just above). The
+          // client's initial F/Z commands typically arrive before that, so
+          // check_frequency()'s real clamp never gets applied until the user
+          // manually touches zoom/center. Re-run it here, on every spectrum
+          // status update, so the view self-corrects as soon as real frontend
+          // data is available, with no user action required.
+          check_frequency(sp);
 
           struct rtp_header rtp;
           memset(&rtp,0,sizeof(rtp));
